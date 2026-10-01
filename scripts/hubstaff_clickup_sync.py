@@ -2,7 +2,7 @@
 """Polls Hubstaff for new timer start/stop events and posts them to a ClickUp chat channel.
 
 Required environment variables:
-  HUBSTAFF_PERSONAL_ACCESS_TOKEN  Hubstaff personal access token (exchanged for a short-lived access token)
+  HUBSTAFF_PERSONAL_ACCESS_TOKEN  Hubstaff personal access token, used directly as a Bearer token
   CLICKUP_API_TOKEN               ClickUp API token (sent as-is in the Authorization header)
 """
 import json
@@ -17,12 +17,17 @@ HUBSTAFF_ORG_ID = 482654
 CLICKUP_WORKSPACE_ID = "90161343471"
 CLICKUP_CHANNEL_ID = "2kz0huzf-2076"
 
+# Hubstaff's API sits behind Cloudflare and blocks requests without a browser-like User-Agent.
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 STATE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state", "hubstaff_clickup_state.json")
 
 
 def http_json(method, url, headers=None, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("User-Agent", USER_AGENT)
+    req.add_header("Accept", "application/json")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     if data is not None:
@@ -31,20 +36,8 @@ def http_json(method, url, headers=None, body=None):
         return json.loads(resp.read().decode())
 
 
-def hubstaff_access_token():
-    refresh_token = os.environ["HUBSTAFF_PERSONAL_ACCESS_TOKEN"]
-    body = urlencode({"grant_type": "refresh_token", "refresh_token": refresh_token}).encode()
-    req = urllib.request.Request(
-        "https://account.hubstaff.com/access_tokens",
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())["access_token"]
-
-
-def hubstaff_get(path, token, params=None):
+def hubstaff_get(path, params=None):
+    token = os.environ["HUBSTAFF_PERSONAL_ACCESS_TOKEN"]
     url = f"https://api.hubstaff.com/v2{path}"
     if params:
         url += "?" + urlencode(params, doseq=True)
@@ -95,8 +88,6 @@ def main():
         start_dt = stop_dt - timedelta(days=6)
         start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    token = hubstaff_access_token()
-
     events = []
     page_start_id = None
     while True:
@@ -108,7 +99,7 @@ def main():
         }
         if page_start_id:
             params["page_start_id"] = page_start_id
-        resp = hubstaff_get(f"/organizations/{HUBSTAFF_ORG_ID}/tracking_states", token, params)
+        resp = hubstaff_get(f"/organizations/{HUBSTAFF_ORG_ID}/tracking_states", params)
         batch = resp.get("tracking_states", [])
         events.extend(batch)
         if len(batch) < 100:
@@ -122,7 +113,7 @@ def main():
             continue
         uid = str(event["user_id"])
         if uid not in state["user_names"]:
-            user_resp = hubstaff_get(f"/users/{uid}", token)
+            user_resp = hubstaff_get(f"/users/{uid}")
             state["user_names"][uid] = user_resp["user"]["name"]
         name = state["user_names"][uid]
         hhmm = event["occurred_at"][11:16]
