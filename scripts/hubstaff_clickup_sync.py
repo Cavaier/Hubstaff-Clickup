@@ -130,7 +130,8 @@ def main():
             f"\U0001F550 {stockholm_time} Stockholm · {manila_time} Manila"
         )
         clickup_send_message(content)
-        print(f"Posted: {content}")
+        # Deliberately not logging `content`/`name` - workflow logs are visible on public repos.
+        print(f"Posted {event['type']} event (user_id={uid})")
 
     state["last_checked_at"] = stop
     save_state(state)

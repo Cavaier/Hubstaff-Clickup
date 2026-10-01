@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: hubstaff-clickup-sync
@@ -18,16 +18,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # State (last-checked timestamp + cached employee names) lives only in the Actions
+      # cache, never in the git tree - this repo may be public and that data shouldn't be.
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state/hubstaff_clickup_state.json
+          key: hubstaff-state-${{ github.run_id }}
+          restore-keys: |
+            hubstaff-state-
+
       - name: Run sync
         env:
           HUBSTAFF_PERSONAL_ACCESS_TOKEN: ${{ secrets.HUBSTAFF_PERSONAL_ACCESS_TOKEN }}
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
         run: python3 scripts/hubstaff_clickup_sync.py
 
-      - name: Commit updated state
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state/hubstaff_clickup_state.json
-          git diff --cached --quiet || git commit -m "chore: update hubstaff sync state"
-          git push
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state/hubstaff_clickup_state.json
+          key: hubstaff-state-${{ github.run_id }}
