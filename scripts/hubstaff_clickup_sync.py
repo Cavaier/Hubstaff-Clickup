@@ -10,12 +10,16 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 import urllib.request
 import urllib.error
 
 HUBSTAFF_ORG_ID = 482654
 CLICKUP_WORKSPACE_ID = "90161343471"
 CLICKUP_CHANNEL_ID = "2kz0huzf-2076"
+
+STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
+MANILA_TZ = ZoneInfo("Asia/Manila")
 
 # Hubstaff's API sits behind Cloudflare and blocks requests without a browser-like User-Agent.
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -116,11 +120,15 @@ def main():
             user_resp = hubstaff_get(f"/users/{uid}")
             state["user_names"][uid] = user_resp["user"]["name"]
         name = state["user_names"][uid]
-        hhmm = event["occurred_at"][11:16]
-        if event["type"] == "start":
-            content = f"\U0001F7E2 **{name}** clocked in at {hhmm} UTC _(automated via Hubstaff)_"
-        else:
-            content = f"\U0001F534 **{name}** clocked out at {hhmm} UTC _(automated via Hubstaff)_"
+        occurred_dt = datetime.strptime(event["occurred_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        stockholm_time = occurred_dt.astimezone(STOCKHOLM_TZ).strftime("%H:%M")
+        manila_time = occurred_dt.astimezone(MANILA_TZ).strftime("%H:%M")
+        verb = "clocked in" if event["type"] == "start" else "clocked out"
+        emoji = "\U0001F7E2" if event["type"] == "start" else "\U0001F534"
+        content = (
+            f"{emoji} **{name}** {verb} at {stockholm_time} Stockholm / {manila_time} Manila "
+            f"_(automated via Hubstaff)_"
+        )
         clickup_send_message(content)
         print(f"Posted: {content}")
 
