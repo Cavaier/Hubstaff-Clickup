@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "paper": {
+      "command": "/Users/eliandersson/.paper/bin/paper",
+      "args": ["mcp"]
+    },
+    "hubstaff": {
+      "type": "http",
+      "url": "https://mcp.hubstaff.com/"
+    }
+  }
+}

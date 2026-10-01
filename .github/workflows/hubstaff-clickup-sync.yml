@@ -1,0 +1,33 @@
+name: Hubstaff clock in/out to ClickUp
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hubstaff-clickup-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run sync
+        env:
+          HUBSTAFF_PERSONAL_ACCESS_TOKEN: ${{ secrets.HUBSTAFF_PERSONAL_ACCESS_TOKEN }}
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: python3 scripts/hubstaff_clickup_sync.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/hubstaff_clickup_state.json
+          git diff --cached --quiet || git commit -m "chore: update hubstaff sync state"
+          git push
