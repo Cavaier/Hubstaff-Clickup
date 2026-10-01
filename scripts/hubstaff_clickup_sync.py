@@ -118,9 +118,9 @@ def main():
         name = state["user_names"][uid]
         hhmm = event["occurred_at"][11:16]
         if event["type"] == "start":
-            content = f"\U0001F7E2 **{name}** clocked in at {hhmm} UTC"
+            content = f"\U0001F7E2 **{name}** clocked in at {hhmm} UTC _(automated via Hubstaff)_"
         else:
-            content = f"\U0001F534 **{name}** clocked out at {hhmm} UTC"
+            content = f"\U0001F534 **{name}** clocked out at {hhmm} UTC _(automated via Hubstaff)_"
         clickup_send_message(content)
         print(f"Posted: {content}")
 
