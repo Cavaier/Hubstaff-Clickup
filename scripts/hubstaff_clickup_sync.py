@@ -127,8 +127,7 @@ def main():
         emoji = "\U0001F7E2" if event["type"] == "start" else "\U0001F534"
         content = (
             f"{emoji} **{label}** — {name}\n"
-            f"\U0001F550 {stockholm_time} Stockholm · {manila_time} Manila\n"
-            f"_Automated via Hubstaff_"
+            f"\U0001F550 {stockholm_time} Stockholm · {manila_time} Manila"
         )
         clickup_send_message(content)
         print(f"Posted: {content}")
