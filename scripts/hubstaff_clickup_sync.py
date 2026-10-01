@@ -123,11 +123,12 @@ def main():
         occurred_dt = datetime.strptime(event["occurred_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         stockholm_time = occurred_dt.astimezone(STOCKHOLM_TZ).strftime("%H:%M")
         manila_time = occurred_dt.astimezone(MANILA_TZ).strftime("%H:%M")
-        verb = "clocked in" if event["type"] == "start" else "clocked out"
+        label = "Clocked In" if event["type"] == "start" else "Clocked Out"
         emoji = "\U0001F7E2" if event["type"] == "start" else "\U0001F534"
         content = (
-            f"{emoji} **{name}** {verb} at {stockholm_time} Stockholm / {manila_time} Manila "
-            f"_(automated via Hubstaff)_"
+            f"{emoji} **{label}** — {name}\n"
+            f"\U0001F550 {stockholm_time} Stockholm · {manila_time} Manila\n"
+            f"_Automated via Hubstaff_"
         )
         clickup_send_message(content)
         print(f"Posted: {content}")
