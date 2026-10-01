@@ -1,8 +1,9 @@
 name: Hubstaff clock in/out to ClickUp
 
 on:
-  schedule:
-    - cron: "2-57/5 * * * *"
+  # No `schedule:` trigger here - GitHub's native cron never reliably fired for this
+  # workflow (see commit history). An external cron-job.org job now calls workflow_dispatch
+  # directly via the GitHub API on its own schedule instead.
   workflow_dispatch: {}
 
 permissions:
