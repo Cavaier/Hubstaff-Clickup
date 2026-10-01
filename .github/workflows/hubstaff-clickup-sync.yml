@@ -8,10 +8,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: hubstaff-clickup-sync
-  cancel-in-progress: false
-
 jobs:
   sync:
     runs-on: ubuntu-latest
