@@ -9,12 +9,23 @@ Posts Hubstaff clock-in / clock-out events into a ClickUp chat channel:
 
 ## How it runs
 
-`scripts/hubstaff_clickup_sync.py` (stdlib only, no dependencies) reads Hubstaff's
-`tracking_states` API and posts to the ClickUp chat API.
+**The live system is the Cloudflare Worker in [`worker/`](worker/).** It polls every
+minute on a cron trigger, keeps state in KV, and posts to ClickUp directly. Start there.
 
-There is no `schedule:` trigger — GitHub's native cron never fired this workflow
-reliably. An external **cron-job.org** job calls `workflow_dispatch` through the GitHub
-API instead, so the job's cadence is configured there, not in this repo.
+**The GitHub Actions workflow and `scripts/hubstaff_clickup_sync.py` are dormant.** They
+are kept as the rollback path, not as a backup: the two keep separate state — the Worker
+in KV, the Actions job on the `state` branch — so running both means every event posts
+twice. Only one may be live at a time. cron-job.org is paused; re-pointing it at the
+workflow is how you roll back, and the Worker's cron must be removed first.
+
+### Why it moved off Actions
+
+Every poll cost a whole workflow run — queue, runner provisioning, checkout — for under a
+second of work. At one dispatch a minute that has no headroom. On 2026-10-05 GitHub's
+provisioning slowed, arrivals outpaced drains, and the backlog grew without bound; runs
+sat queued for 15 minutes and the sync effectively stopped. A cron trigger has nothing in
+front of it, and 1,440 Worker invocations a day is unremarkable where 1,440 workflow runs
+a day is not.
 
 ## Delivery guarantees
 
@@ -92,7 +103,10 @@ Covers the cold-start guard, dedupe across runs, the orphaned-start case that ca
 the original bug, partial-failure handling, pruning, timestamp parsing, and bounce
 collapsing in both the on and off configurations.
 
-## Setup
+## Setup (dormant Actions path)
+
+Everything below describes the Actions workflow, which is not currently running. For the
+live system see [`worker/README.md`](worker/README.md).
 
 Repository secrets:
 
