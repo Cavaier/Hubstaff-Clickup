@@ -41,17 +41,23 @@ MANILA_TZ = ZoneInfo("Asia/Manila")
 # hours of events for a handful of members is a single page, so this is nearly free.
 LOOKBACK_MINUTES = 360
 
-# Events newer than this are fetched but not posted yet, so that a stop still has time
-# to be joined by its partner start before we decide whether to collapse the pair.
-# Must stay larger than PAIR_COLLAPSE_SECONDS or a stop would post alone and the start
-# would follow on a later run. This is the notification delay; lower it for a snappier
-# feed at the cost of occasionally posting both halves of a bounce.
-SETTLE_SECONDS = 90
+# Hold-back before an event may be posted. Zero by default: notifications should land
+# as fast as the runner can post them. This has nothing to do with delivery guarantees -
+# those come from the event-id dedupe below - it exists only to buy time for bounce
+# collapsing, which is off. See PAIR_COLLAPSE_SECONDS.
+SETTLE_SECONDS = 0
 
 # A stop immediately followed by the same member starting again is the desktop client
-# recovering from an idle prompt or a network blip, not somebody leaving. Posting both
-# halves is pure noise, so a pair this close together is suppressed entirely.
-PAIR_COLLAPSE_SECONDS = 60
+# recovering from an idle prompt or a network blip rather than somebody leaving, so both
+# halves could be suppressed as noise. Disabled (0), because deciding whether a stop has
+# a partner means waiting SETTLE_SECONDS to find out, and a prompt feed is worth more
+# than an occasional redundant pair.
+#
+# To enable: set this to the bounce width you want swallowed and SETTLE_SECONDS to
+# something comfortably larger (e.g. 60 and 90). SETTLE_SECONDS must stay the larger of
+# the two, or a stop posts alone and its partner start follows on a later run - the
+# worst of both worlds.
+PAIR_COLLAPSE_SECONDS = 0
 
 # Cap on remembered ids. Hubstaff ids increase over time, so keeping the highest N is
 # the same as keeping the most recent N. Needs to comfortably exceed the number of
@@ -180,6 +186,9 @@ def find_bounce_pairs(events, already_posted):
     already went out on an earlier run, swallowing the start would recreate the very
     bug this script exists to fix: a member shown clocked out while actually working.
     """
+    if PAIR_COLLAPSE_SECONDS <= 0:
+        return set()
+
     suppressed = set()
     by_user = {}
     for event in events:

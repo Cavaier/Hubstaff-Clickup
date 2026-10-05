@@ -35,19 +35,37 @@ missed cron fire, a lost state file, or two overlapping runs.
 
 | Behaviour | Where |
 |---|---|
-| Re-reads a 6h window every run, dedupes on event id | `LOOKBACK_MINUTES` |
-| Holds events back briefly so bounce pairs resolve | `SETTLE_SECONDS` (90s) |
-| Drops stop→start bounces by the same member | `PAIR_COLLAPSE_SECONDS` (60s) |
+| Re-reads a 6h window every run, dedupes on event id | `LOOKBACK_MINUTES` (360) |
 | Remembers the most recent ids, pruned by value | `MAX_REMEMBERED_IDS` (1000) |
+| Hold-back before an event may post | `SETTLE_SECONDS` (0 — off) |
+| Drops stop→start bounces by the same member | `PAIR_COLLAPSE_SECONDS` (0 — off) |
 
-`SETTLE_SECONDS` must stay larger than `PAIR_COLLAPSE_SECONDS`, or a stop posts alone
-and its partner start follows on a later run. It is also the notification delay —
-lower both for a snappier feed, at the cost of occasionally posting both halves of a
-client bounce.
+## Latency
 
-A bounce pair is only collapsed when **neither** half has been posted yet. If the stop
-already went out, the start is always posted — swallowing it would recreate the exact
-bug above.
+Events post as soon as a run picks them up. End to end that is roughly **5–10 seconds**
+from dispatch — runner start ~3s, checkout and state restore ~2s, the post itself well
+under a second — on top of however long it is until the next cron-job.org fire.
+
+At a one-minute cadence the polling interval is therefore the whole story: 0–60s of
+waiting, then a few seconds of work. Nothing else in this repo is worth optimising
+until that changes; the only way materially below it is Hubstaff webhooks, which would
+push events instead of being polled for them.
+
+`SETTLE_SECONDS` and `PAIR_COLLAPSE_SECONDS` are both **off**, which is what keeps that
+number low. They exist for noise reduction: a stop immediately followed by the same
+member starting again is usually the desktop client recovering from an idle prompt or a
+network blip, and both halves could be suppressed. Deciding that means waiting to see
+whether a partner event turns up, so it costs latency on *every* notification to tidy up
+an occasional pair. Set `PAIR_COLLAPSE_SECONDS` to the bounce width you want swallowed
+and `SETTLE_SECONDS` to something comfortably larger (e.g. 60 and 90) to turn it on.
+`SETTLE_SECONDS` must be the larger of the two, or a stop posts alone and its partner
+follows on a later run — the worst of both worlds.
+
+None of this affects delivery. **Events are never dropped for being too fast or too
+slow**; that guarantee comes entirely from the 6h re-read plus the event-id dedupe,
+which are independent of both constants. When collapsing is on, a pair is only
+collapsed if *neither* half has posted yet — if the stop already went out, the start
+always posts, because swallowing it would recreate the exact bug above.
 
 ## State
 
