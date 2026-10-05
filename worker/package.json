@@ -1,0 +1,5 @@
+{
+  "name": "hubstaff-clickup-worker",
+  "private": true,
+  "type": "module"
+}

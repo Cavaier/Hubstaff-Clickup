@@ -1,0 +1,19 @@
+name = "hubstaff-clickup-sync"
+main = "src/worker.js"
+compatibility_date = "2026-10-05"
+
+# Every minute. Free plan allows cron triggers; a tick is one request, so this
+# uses 1,440 of the 100,000/day request budget.
+[triggers]
+crons = ["* * * * *"]
+
+# Create with:  wrangler kv namespace create SYNC_STATE
+# then paste the printed id below.
+[[kv_namespaces]]
+binding = "SYNC_STATE"
+id = "PASTE_KV_NAMESPACE_ID_HERE"
+
+# Secrets are NOT set here - they would end up in git. Set them with:
+#   wrangler secret put HUBSTAFF_PERSONAL_ACCESS_TOKEN
+#   wrangler secret put CLICKUP_API_TOKEN
+#   wrangler secret put TRIGGER_TOKEN        # optional, enables POST /run
