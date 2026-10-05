@@ -6,8 +6,15 @@ on:
   # directly via the GitHub API on its own schedule instead.
   workflow_dispatch: {}
 
+# Two runs must never overlap: both would read the same state and could post the same
+# event twice before either saved. Queued rather than cancelled, though a cancelled run
+# loses nothing - the next run re-reads the same window.
+concurrency:
+  group: hubstaff-clickup-sync
+  cancel-in-progress: false
+
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   sync:
@@ -15,15 +22,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # State (last-checked timestamp + cached employee names) lives only in the Actions
-      # cache, never in the git tree - this repo may be public and that data shouldn't be.
-      - name: Restore state cache
-        uses: actions/cache/restore@v4
-        with:
-          path: state/hubstaff_clickup_state.json
-          key: hubstaff-state-${{ github.run_id }}
-          restore-keys: |
-            hubstaff-state-
+      # State lives on the orphan `state` branch rather than in the Actions cache.
+      # Cache entries are branch-scoped and evicted after 7 days, and a cache miss used
+      # to fall back to "the last 10 minutes" silently, skipping every event older than
+      # that. A missing branch here is loud and makes the script seed instead of post.
+      #
+      # The file holds nothing but opaque Hubstaff event ids - no names, no timestamps,
+      # no member ids - so it is safe to keep in a public repo.
+      - name: Restore state
+        run: |
+          mkdir -p state
+          if git fetch --depth=1 origin state 2>/dev/null \
+             && git show FETCH_HEAD:hubstaff_clickup_state.json > state/hubstaff_clickup_state.json 2>/dev/null; then
+            echo "state restored ($(wc -c < state/hubstaff_clickup_state.json) bytes)"
+          else
+            rm -f state/hubstaff_clickup_state.json
+            echo "no usable state branch - this run will seed one and post nothing"
+          fi
 
       - name: Run sync
         env:
@@ -31,9 +46,30 @@ jobs:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
         run: python3 scripts/hubstaff_clickup_sync.py
 
-      - name: Save state cache
+      # Runs even when the sync step failed: the script saves the ids it did post before
+      # exiting non-zero, and losing those would mean re-posting them next run.
+      - name: Persist state
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: state/hubstaff_clickup_state.json
-          key: hubstaff-state-${{ github.run_id }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f state/hubstaff_clickup_state.json ] || { echo "nothing to persist"; exit 0; }
+          work="$(mktemp -d)"
+          cp state/hubstaff_clickup_state.json "$work/hubstaff_clickup_state.json"
+          cd "$work"
+          git init -q
+          git checkout -q -b state
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add hubstaff_clickup_state.json
+          git commit -q -m "Update sync state"
+          # Force-pushed as a fresh single-commit orphan branch each run, so the branch
+          # never accumulates history. Safe because `concurrency` serialises runs and
+          # nothing else writes it.
+          if ! git push -q --force \
+               "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" state; then
+            echo "::error::Could not push the state branch. Check Settings > Actions > General >" \
+                 "Workflow permissions is set to 'Read and write permissions' - a repo set to" \
+                 "read-only overrides this workflow's 'contents: write'."
+            exit 1
+          fi

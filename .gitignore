@@ -1,3 +1,5 @@
 .DS_Store
 .env.local
 state/hubstaff_clickup_state.json
+__pycache__/
+*.pyc
