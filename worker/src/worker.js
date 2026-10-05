@@ -187,13 +187,28 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
-      const state = await env.SYNC_STATE.get(STATE_KEY, "json");
-      return Response.json({
-        ok: true,
-        seeded: Boolean(state && Array.isArray(state.ids)),
-        last_state_write: (state && state.ts) || null,
-        remembered_ids: (state && state.ids && state.ids.length) || 0,
-      });
+      // Report a misconfiguration as readable JSON. Reaching into a missing binding or
+      // secret otherwise throws, and the Worker surfaces that as a bare "Error 1101"
+      // with nothing to act on.
+      const missing = ["SYNC_STATE", "HUBSTAFF_PERSONAL_ACCESS_TOKEN", "CLICKUP_API_TOKEN"]
+        .filter((k) => !env[k]);
+      if (missing.length) {
+        return Response.json(
+          { ok: false, missing, hint: "Worker -> Settings: SYNC_STATE is a KV namespace binding; the other two are Secrets." },
+          { status: 500 },
+        );
+      }
+      try {
+        const state = await env.SYNC_STATE.get(STATE_KEY, "json");
+        return Response.json({
+          ok: true,
+          seeded: Boolean(state && Array.isArray(state.ids)),
+          last_state_write: (state && state.ts) || null,
+          remembered_ids: (state && state.ids && state.ids.length) || 0,
+        });
+      } catch (e) {
+        return Response.json({ ok: false, error: e && e.message }, { status: 500 });
+      }
     }
 
     // Manual tick, for verifying a deploy without waiting for the cron.
