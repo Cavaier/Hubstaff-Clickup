@@ -81,6 +81,17 @@ guard — without it an empty state plus a 6-hour lookback would dump hours of b
 into the channel at once. It also means the first run after deploying posts nothing,
 and events from the preceding 6 hours are marked handled rather than sent.
 
+## Tests
+
+```
+python3 tests/test_sync.py
+```
+
+Stdlib only, no tokens, no network — the Hubstaff and ClickUp calls are stubbed.
+Covers the cold-start guard, dedupe across runs, the orphaned-start case that caused
+the original bug, partial-failure handling, pruning, timestamp parsing, and bounce
+collapsing in both the on and off configurations.
+
 ## Setup
 
 Repository secrets:
