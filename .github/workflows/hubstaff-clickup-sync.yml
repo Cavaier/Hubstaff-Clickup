@@ -6,12 +6,18 @@ on:
   # directly via the GitHub API on its own schedule instead.
   workflow_dispatch: {}
 
-# Two runs must never overlap: both would read the same state and could post the same
-# event twice before either saved. Queued rather than cancelled, though a cancelled run
-# loses nothing - the next run re-reads the same window.
-concurrency:
-  group: hubstaff-clickup-sync
-  cancel-in-progress: false
+# DO NOT add a `concurrency:` group here. It was tried and it broke the sync.
+#
+# cron-job.org dispatches this every minute. A concurrency group lets GitHub hold only
+# one pending run, so as soon as acquiring a runner takes longer than the dispatch
+# interval - which it does under GitHub-side contention; one run sat queued for 15
+# minutes - every new dispatch cancels the previous pending one and essentially nothing
+# completes. It is self-sustaining once the queue backs up.
+#
+# Without it two runs can overlap and, if both read state before either writes, post the
+# same event twice. That window is a few seconds against a 60s interval, and a duplicate
+# message is far cheaper than a dead sync. Proper atomic claim-before-post needs a real
+# compare-and-set store, not a git branch.
 
 permissions:
   contents: write
