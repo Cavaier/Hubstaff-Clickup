@@ -23,9 +23,17 @@
  * post succeeds, a failed post releases the row immediately, and a claim left
  * stranded by a dead invocation is retaken after STALE_CLAIM_MS.
  *
+ * FAST PATH. Hubstaff's timer.start / timer.stop webhook wakes sync() at once
+ * instead of waiting for the next minute. It deliberately does not post from the
+ * webhook payload: a delivery's id is a UUID unrelated to the tracking_states id,
+ * so posting from it would bypass the claim and race the cron into a duplicate.
+ * Waking sync() means both paths take the same INSERT OR IGNORE claim, and the
+ * cron stays the safety net for any delivery Hubstaff drops.
+ *
  * Bindings: D1 database DB, KV namespace SYNC_STATE (only to migrate off KV once)
  * Secrets:  HUBSTAFF_PERSONAL_ACCESS_TOKEN, CLICKUP_API_TOKEN
- *           TRIGGER_TOKEN (optional, enables POST /run)
+ *           TRIGGER_TOKEN (optional, enables POST /run and POST /webhook/register)
+ *           WEBHOOK_KEY (optional, enables the webhook; part of its target URL)
  */
 
 const HUBSTAFF_ORG_ID = 482654;
@@ -41,6 +49,14 @@ const STALE_CLAIM_MS = 120_000;
 
 // Rows older than this are pruned; only ever read back within LOOKBACK_MINUTES.
 const RETAIN_DAYS = 7;
+
+// A webhook can arrive before the tracking state it announces is readable from the
+// API. Retry sync() on these offsets (ms) until it claims something; the cron
+// catches anything still invisible after the last one.
+const WEBHOOK_SYNC_DELAYS_MS = [0, 3_000, 8_000, 15_000];
+
+const WEBHOOK_EVENTS = ["timer.start", "timer.stop"];
+const WEBHOOK_PATH = "/hubstaff/webhook";
 
 // Hubstaff's API sits behind Cloudflare and blocks requests without a browser-like UA.
 const USER_AGENT =
@@ -74,19 +90,21 @@ async function ensureSchema(env) {
   await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
 }
 
-async function hubstaffGet(env, path, params) {
+async function hubstaffRequest(env, method, path, { params, body } = {}) {
   const url = new URL(`https://api.hubstaff.com/v2${path}`);
   for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${env.HUBSTAFF_PERSONAL_ACCESS_TOKEN}`,
-      Accept: "application/json",
-      "User-Agent": USER_AGENT,
-    },
-  });
+  const headers = {
+    Authorization: `Bearer ${env.HUBSTAFF_PERSONAL_ACCESS_TOKEN}`,
+    Accept: "application/json",
+    "User-Agent": USER_AGENT,
+  };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   if (!res.ok) throw new Error(`Hubstaff ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  return res.json();
+  return res.status === 204 ? null : res.json();
 }
+
+const hubstaffGet = (env, path, params) => hubstaffRequest(env, "GET", path, { params });
 
 async function clickupSend(env, content) {
   const res = await fetch(
@@ -284,6 +302,127 @@ export async function sync(env) {
   return { posted, skipped, failures };
 }
 
+// ---------------------------------------------------------------- webhook
+// Spec: https://developer.hubstaff.com/webhooks
+//   handshake  empty-body POST carrying X-Hook-Secret; reply 200 echoing it.
+//              Echoing makes the webhook active directly - no activate call.
+//   delivery   JSON POST; X-Hook-Signature is hex HMAC-SHA256(raw body, secret).
+//              2xx is success, 5xx/timeouts are retried, 404/410 disable the hook.
+
+async function getMeta(env, key) {
+  const row = await env.DB.prepare("SELECT value FROM meta WHERE key = ?").bind(key).first();
+  return row ? row.value : null;
+}
+
+const setMeta = (env, key, value) =>
+  env.DB.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").bind(key, value).run();
+
+function hexToBytes(hex) {
+  if (typeof hex !== "string" || !/^(?:[0-9a-fA-F]{2})+$/.test(hex)) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** Constant-time check of X-Hook-Signature: subtle.verify compares without leaking timing. */
+export async function verifySignature(secret, rawBody, signatureHex) {
+  const sig = hexToBytes(signatureHex);
+  if (!secret || !sig) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  return crypto.subtle.verify("HMAC", key, sig, rawBody);
+}
+
+/** Run sync() now, retrying briefly in case the API has not caught up with the push. */
+export async function webhookSync(env, delays = WEBHOOK_SYNC_DELAYS_MS) {
+  let waited = 0;
+  for (const at of delays) {
+    if (at > waited) await new Promise((r) => setTimeout(r, at - waited));
+    waited = at;
+    const r = await sync(env);
+    // posted: we got it. skipped: a concurrent tick holds the claim. Either way done.
+    if (r.posted || r.skipped || r.bootstrapped) return r;
+  }
+  return { posted: 0 };
+}
+
+async function handleWebhook(request, env, ctx) {
+  // The key in the target URL is what stops anyone else from completing a
+  // handshake and installing an HMAC secret of their choosing. 403, never 404:
+  // Hubstaff disables a webhook whose target answers 404.
+  const key = new URL(request.url).searchParams.get("key");
+  if (!env.WEBHOOK_KEY || key !== env.WEBHOOK_KEY) return new Response("Forbidden", { status: 403 });
+
+  await ensureSchema(env);
+
+  const handshake = request.headers.get("X-Hook-Secret");
+  if (handshake) {
+    await setMeta(env, "webhook_secret", handshake);
+    console.log("webhook handshake: secret stored");
+    return new Response(null, { status: 200, headers: { "X-Hook-Secret": handshake } });
+  }
+
+  const raw = await request.arrayBuffer();
+  const secret = await getMeta(env, "webhook_secret");
+  if (!(await verifySignature(secret, raw, request.headers.get("X-Hook-Signature")))) {
+    console.log("webhook rejected: bad signature");
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let delivery;
+  try {
+    delivery = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
+  if (WEBHOOK_EVENTS.includes(delivery.event)) {
+    console.log(`webhook ${delivery.event} ${delivery.id}`);
+    ctx.waitUntil(
+      Promise.all([setMeta(env, "webhook_last_delivery", new Date().toISOString()), webhookSync(env)]).then(
+        ([, r]) => console.log("webhook sync ok", JSON.stringify(r)),
+        (e) => console.log("webhook sync failed:", e && e.message),
+      ),
+    );
+  }
+  return new Response(null, { status: 200 });
+}
+
+/**
+ * Create the org webhook pointing at this Worker. Hubstaff then sends the
+ * handshake, which handleWebhook answers. Refuses if one is already registered
+ * unless ?replace=1, which deletes the old one first - two live webhooks would
+ * each overwrite the other's secret and fail every delivery.
+ */
+async function registerWebhook(request, env) {
+  if (!env.WEBHOOK_KEY) return Response.json({ error: "set the WEBHOOK_KEY secret first" }, { status: 400 });
+  await ensureSchema(env);
+  const url = new URL(request.url);
+  const existing = await getMeta(env, "webhook_id");
+  if (existing) {
+    if (url.searchParams.get("replace") !== "1") {
+      return Response.json({ error: "already registered", webhook_id: existing }, { status: 409 });
+    }
+    try {
+      await hubstaffRequest(env, "DELETE", `/webhooks/${existing}`);
+    } catch (e) {
+      console.log(`delete of old webhook ${existing} failed: ${e && e.message}`);
+    }
+  }
+  const target = new URL(WEBHOOK_PATH, url.origin);
+  target.searchParams.set("key", env.WEBHOOK_KEY);
+  const created = await hubstaffRequest(env, "POST", `/organizations/${HUBSTAFF_ORG_ID}/webhooks`, {
+    body: { events: WEBHOOK_EVENTS, target_url: target.toString() },
+  });
+  const id = created && (created.webhook ? created.webhook.id : created.id);
+  if (id) await setMeta(env, "webhook_id", String(id));
+  return Response.json({ webhook_id: id ?? null, response: created });
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
@@ -294,8 +433,29 @@ export default {
     );
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === WEBHOOK_PATH && request.method === "POST") {
+      try {
+        return await handleWebhook(request, env, ctx);
+      } catch (e) {
+        // 5xx so Hubstaff retries; the cron covers it meanwhile.
+        console.log("webhook error:", e && e.message);
+        return new Response("Error", { status: 500 });
+      }
+    }
+
+    if (url.pathname === "/webhook/register" && request.method === "POST") {
+      if (!env.TRIGGER_TOKEN || url.searchParams.get("token") !== env.TRIGGER_TOKEN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      try {
+        return await registerWebhook(request, env);
+      } catch (e) {
+        return Response.json({ error: e && e.message }, { status: 502 });
+      }
+    }
 
     if (url.pathname === "/health") {
       const missing = ["DB", "HUBSTAFF_PERSONAL_ACCESS_TOKEN", "CLICKUP_API_TOKEN"].filter((k) => !env[k]);
@@ -317,6 +477,12 @@ export default {
           bootstrapped: boot ? boot.value : null,
           tracked_events: (counts && counts.total) || 0,
           sent_events: (counts && counts.sent) || 0,
+          webhook: {
+            enabled: Boolean(env.WEBHOOK_KEY),
+            id: await getMeta(env, "webhook_id"),
+            verified: Boolean(await getMeta(env, "webhook_secret")),
+            last_delivery: await getMeta(env, "webhook_last_delivery"),
+          },
         });
       } catch (e) {
         return Response.json({ ok: false, error: e && e.message }, { status: 500 });

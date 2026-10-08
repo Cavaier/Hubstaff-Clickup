@@ -14,16 +14,17 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "hubstaff-clickup"
-database_id = "PASTE_D1_DATABASE_ID_HERE"
+database_id = "d318b9f8-f50d-4c55-8101-5d5dcaa1af71"
 
 # Kept only so the first run can carry the already-posted ids out of KV and into
 # D1. Safe to delete this binding and the namespace once /health reports
 # "bootstrapped".
 [[kv_namespaces]]
 binding = "SYNC_STATE"
-id = "PASTE_KV_NAMESPACE_ID_HERE"
+id = "28b9f11ee3074598b1cdf9b1e621a150"
 
 # Secrets are NOT set here - they would end up in git. Set them with:
 #   wrangler secret put HUBSTAFF_PERSONAL_ACCESS_TOKEN
 #   wrangler secret put CLICKUP_API_TOKEN
-#   wrangler secret put TRIGGER_TOKEN        # optional, enables POST /run
+#   wrangler secret put TRIGGER_TOKEN        # optional, enables POST /run and /webhook/register
+#   wrangler secret put WEBHOOK_KEY          # optional, enables the Hubstaff webhook

@@ -119,10 +119,38 @@ No network, no Cloudflare, no tokens. Covers the seed guard, dedupe across ticks
 zero-write idle tick, partial-failure handling, and that messages render byte-identical
 to what is already in the channel.
 
-## Later: the webhook
+## The webhook (fast path)
 
-Hubstaff pushes `timer.start` / `timer.stop`, which would cut delivery to ~1s. The
-`fetch` handler here is where that endpoint goes. It needs Hubstaff's `X-Hook-Secret`
-handshake and HMAC verification implemented exactly, and the cron stays as the safety
-net — a webhook alone has no recovery path, and a dropped delivery would be gone for
-good.
+Hubstaff pushes `timer.start` / `timer.stop` to `POST /hubstaff/webhook?key=$WEBHOOK_KEY`,
+cutting delivery from up to a minute to a few seconds. The cron stays as the safety
+net: a webhook alone has no recovery path, and a dropped delivery would be gone.
+
+**The webhook never posts from its payload.** A delivery's `id` is a UUID unrelated to
+the tracking-state id the claim is keyed on, so posting from it would bypass the claim
+and race the cron into exactly the duplicate D1 was brought in to stop. Instead a
+delivery just wakes `sync()`, retrying at 0s/3s/8s/15s in case the API has not caught
+up with the push yet. Webhook and cron then take the same `INSERT OR IGNORE` claim, and
+one of them posts.
+
+Implemented to [the spec](https://developer.hubstaff.com/webhooks):
+
+| | |
+|---|---|
+| Handshake | Empty-body POST with `X-Hook-Secret`. We store it in D1 and reply 200 echoing it, which makes the webhook `active` (no separate activate call). |
+| Delivery | `X-Hook-Signature` is hex HMAC-SHA256 of the raw body keyed by that secret, checked in constant time; mismatch → 401. |
+| URL key | The handshake is only accepted on a URL carrying `WEBHOOK_KEY`, so nobody else can install an HMAC key of their choosing. Wrong key → 403, never 404: Hubstaff disables a webhook whose target returns 404/410. |
+| Errors | 5xx, which Hubstaff retries. |
+
+Enable it:
+
+```bash
+npx wrangler secret put WEBHOOK_KEY      # any long random string
+npx wrangler secret put TRIGGER_TOKEN
+curl -X POST "https://hubstaff-clickup-sync.<sub>.workers.dev/webhook/register?token=$TRIGGER_TOKEN"
+```
+
+That creates the org webhook with `HUBSTAFF_PERSONAL_ACCESS_TOKEN`, which needs the
+`hubstaff:write` scope. `/health` then shows `webhook.verified: true` once the handshake
+lands (~15s), and `webhook.last_delivery` once pushes arrive. Re-registering needs
+`&replace=1`, which deletes the old webhook first — two live ones would overwrite each
+other's secret.

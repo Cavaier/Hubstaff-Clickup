@@ -6,7 +6,8 @@
  * actual SQL ones (INSERT OR IGNORE, changes) rather than a hand-written mock.
  */
 import { DatabaseSync } from "node:sqlite";
-import { sync } from "../src/worker.js";
+import { createHmac } from "node:crypto";
+import worker, { sync, webhookSync } from "../src/worker.js";
 
 const yield_ = () => new Promise((r) => setImmediate(r));
 const plain = (v) => (typeof v === "bigint" ? Number(v) : v);
@@ -133,6 +134,57 @@ console.log("=== 6. rendering ===");
 for (const p of posts) console.log("  " + p.replace("\n", " / "));
 expect(posts.includes("\u{1F534} **Clocked Out** — User8\n\u{1F550} 00:51 Stockholm · 06:51 Manila"),
   "clock-out renders byte-identical to the channel");
+
+// ---------------------------------------------------------------- webhook
+const sign = (secret, body) => createHmac("sha256", secret).update(body).digest("hex");
+const hook = (path, headers = {}, body = "") =>
+  new Request(`https://w.example${path}`, { method: "POST", headers, body: body || undefined });
+const ctxStub = () => { const p = []; return { waitUntil: (x) => p.push(x), settle: () => Promise.all(p) }; };
+const wenv = (db) => ({ ...env(db, null), WEBHOOK_KEY: "k1" });
+
+db = makeD1(); posts = [];
+EVENTS = [{ id: 500, occurred_at: ago(60), type: "start", user_id: 9 }];
+await sync(wenv(db));                            // bootstrap/seed
+
+let res = await worker.fetch(hook("/hubstaff/webhook?key=nope", { "X-Hook-Secret": "evil" }), wenv(db), ctxStub());
+console.log("=== 7. webhook handshake ===");
+expect(res.status === 403, "handshake without the URL key is refused (403, not 404)");
+res = await worker.fetch(hook("/hubstaff/webhook?key=k1", { "X-Hook-Secret": "s3cret" }), wenv(db), ctxStub());
+expect(res.status === 200 && res.headers.get("X-Hook-Secret") === "s3cret", "handshake echoes X-Hook-Secret with 200");
+
+EVENTS = [...EVENTS, { id: 501, occurred_at: ago(2), type: "stop", user_id: 9 }];
+const body = JSON.stringify({ id: "uuid-1", event: "timer.stop", payload: { user_id: 9 } });
+let c = ctxStub();
+res = await worker.fetch(hook("/hubstaff/webhook?key=k1", { "X-Hook-Signature": sign("wrong", body) }, body), wenv(db), c);
+await c.settle();
+console.log("=== 8. webhook delivery ===");
+expect(res.status === 401 && posts.length === 0, "a bad signature is rejected with 401 and posts nothing");
+res = await worker.fetch(hook("/hubstaff/webhook?key=k1", { "X-Hook-Signature": "zz" }, body), wenv(db), c);
+expect(res.status === 401, "a malformed signature is rejected");
+c = ctxStub();
+res = await worker.fetch(hook("/hubstaff/webhook?key=k1", { "X-Hook-Signature": sign("s3cret", body) }, body), wenv(db), c);
+await c.settle();
+expect(res.status === 200 && posts.length === 1 && posts[0].includes("User9"), "a signed delivery posts the event at once");
+c = ctxStub();
+await worker.fetch(hook("/hubstaff/webhook?key=k1", { "X-Hook-Signature": sign("s3cret", body) }, body), wenv(db), c);
+await c.settle();
+expect(posts.length === 1, "a redelivery of the same push posts nothing more");
+
+// The point of routing the webhook through sync(): it races the cron and still posts once.
+EVENTS = [...EVENTS, { id: 502, occurred_at: ago(1), type: "start", user_id: 10 }];
+posts = []; clickupDelayMs = 25;
+const [w, t] = await Promise.all([webhookSync(wenv(db), [0]), sync(wenv(db))]);
+clickupDelayMs = 0;
+console.log("=== 9. webhook vs cron ===", JSON.stringify(w), JSON.stringify(t));
+expect(posts.filter((p) => p.includes("User10")).length === 1, "webhook and cron racing post exactly once");
+
+// Push arrives before the API shows the event: retry, then post.
+EVENTS = EVENTS.filter((e) => e.id !== 503);
+posts = [];
+setTimeout(() => { EVENTS = [...EVENTS, { id: 503, occurred_at: ago(1), type: "stop", user_id: 11 }]; }, 15);
+r = await webhookSync(wenv(db), [0, 40]);
+console.log("=== 10. webhook before the API catches up ===", JSON.stringify(r));
+expect(posts.length === 1 && posts[0].includes("User11"), "retries until the event is visible, then posts it");
 
 console.log(failed ? "\nTESTS FAILED" : "\nALL TESTS PASSED");
 process.exit(failed ? 1 : 0);
