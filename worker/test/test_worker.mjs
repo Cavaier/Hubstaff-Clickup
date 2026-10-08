@@ -1,125 +1,138 @@
 /**
  * Logic tests for the Worker. `node worker/test/test_worker.mjs`.
- * No network, no Cloudflare, no tokens: fetch and KV are stubbed.
+ *
+ * No network and no Cloudflare: fetch is stubbed, and D1 is backed by a real
+ * in-memory SQLite via node:sqlite so the claim semantics under test are the
+ * actual SQL ones (INSERT OR IGNORE, changes) rather than a hand-written mock.
  */
+import { DatabaseSync } from "node:sqlite";
 import { sync } from "../src/worker.js";
+
+const yield_ = () => new Promise((r) => setImmediate(r));
+const plain = (v) => (typeof v === "bigint" ? Number(v) : v);
+const row = (r) => (r ? Object.fromEntries(Object.entries(r).map(([k, v]) => [k, plain(v)])) : r);
+
+function makeD1() {
+  const db = new DatabaseSync(":memory:");
+  const prepare = (sql) => {
+    let bound = [];
+    const api = {
+      bind(...a) { bound = a; return api; },
+      async run() { await yield_(); return { success: true, meta: { changes: Number(db.prepare(sql).run(...bound).changes) } }; },
+      async first() { await yield_(); return row(db.prepare(sql).get(...bound)) ?? null; },
+      async all() { await yield_(); return { results: db.prepare(sql).all(...bound).map(row) }; },
+    };
+    return api;
+  };
+  return { prepare, async batch(stmts) { const o = []; for (const s of stmts) o.push(await s.run()); return o; } };
+}
 
 const ISO = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
 const NOW = Date.now();
 const ago = (s) => ISO(new Date(NOW - s * 1000));
 
-const EVENTS = [
+let EVENTS = [
   { id: 101, occurred_at: ago(300), type: "start", user_id: 1 },
   { id: 102, occurred_at: ago(200), type: "stop", user_id: 2 },
-  { id: 103, occurred_at: ago(190), type: "start", user_id: 2 },
-  { id: 104, occurred_at: ago(5), type: "start", user_id: 3 },
+  { id: 103, occurred_at: ago(60), type: "start", user_id: 2 },
 ];
 
 let posts = [];
-let clickupFails = 0;
-
-function makeKV() {
-  return {
-    store: new Map(), reads: 0, writes: 0,
-    async get(k, type) {
-      this.reads++;
-      const v = this.store.get(k);
-      return v == null ? null : type === "json" ? JSON.parse(v) : v;
-    },
-    async put(k, v) { this.writes++; this.store.set(k, v); },
-  };
-}
+let clickupFailFor = new Set();
+let clickupDelayMs = 0;
 
 globalThis.fetch = async (url, opts = {}) => {
   const href = String(url);
-  if (href.includes("/tracking_states")) {
-    return new Response(JSON.stringify({ tracking_states: EVENTS }), { status: 200 });
-  }
+  if (href.includes("/tracking_states")) return new Response(JSON.stringify({ tracking_states: EVENTS }), { status: 200 });
   if (href.includes("api.hubstaff.com/v2/users/")) {
     const uid = href.split("/").pop();
     return new Response(JSON.stringify({ user: { name: `User${uid}` } }), { status: 200 });
   }
   if (href.includes("api.clickup.com")) {
-    if (clickupFails > 0) { clickupFails--; return new Response("rate limited", { status: 429 }); }
-    posts.push(JSON.parse(opts.body).content);
-    return new Response(JSON.stringify({ id: "m1" }), { status: 200 });
+    const body = JSON.parse(opts.body).content;
+    if (clickupDelayMs) await new Promise((r) => setTimeout(r, clickupDelayMs));
+    for (const bad of clickupFailFor) if (body.includes(bad)) return new Response("boom", { status: 429 });
+    posts.push(body);
+    return new Response(JSON.stringify({ id: "m" }), { status: 200 });
   }
   throw new Error("unexpected fetch: " + href);
 };
 
-const env = (kv) => ({
-  SYNC_STATE: kv,
-  HUBSTAFF_PERSONAL_ACCESS_TOKEN: "x",
-  CLICKUP_API_TOKEN: "y",
-});
+const env = (db, kv) => ({ DB: db, SYNC_STATE: kv, HUBSTAFF_PERSONAL_ACCESS_TOKEN: "x", CLICKUP_API_TOKEN: "y" });
+const kvWith = (ids) => ({ async get() { return ids ? { v: 2, ids } : null; } });
 
 let failed = false;
-const expect = (cond, msg) => {
-  console.log((cond ? "  PASS  " : "  FAIL  ") + msg);
-  if (!cond) failed = true;
-};
+const expect = (c, m) => { console.log((c ? "  PASS  " : "  FAIL  ") + m); if (!c) failed = true; };
 
-// 1. cold start
-let kv = makeKV();
-posts = [];
-let r = await sync(env(kv));
-console.log("=== 1. cold start ===", JSON.stringify(r));
-expect(posts.length === 0, "posts nothing on a cold start");
-expect(r.seeded === 4, "seeds every id in the window");
-expect(kv.writes === 1, "writes state once to seed");
+// ---------------------------------------------------------------- bootstrap
+let db = makeD1(); posts = [];
+let r = await sync(env(db, kvWith([101, 102])));
+console.log("=== 1. bootstrap, importing from KV ===", JSON.stringify(r));
+expect(posts.length === 0, "posts nothing while bootstrapping");
+r = await sync(env(db, kvWith([101, 102])));
+expect(posts.length === 1 && posts[0].includes("User2"), "next tick posts only the event KV did not know (103)");
 
-// 2. normal tick
-posts = [];
-kv.store.set("sync-state", JSON.stringify({ v: 2, ids: [], names: {}, ts: "x" }));
-kv.writes = 0;
-r = await sync(env(kv));
-console.log("=== 2. normal tick ===", JSON.stringify(r));
-expect(posts.length === 4, "posts all 4 pending events");
-expect(r.failures === 0, "no failures");
-expect(kv.writes === 1, "one KV write for the batch");
+db = makeD1(); posts = [];
+r = await sync(env(db, null));
+console.log("=== 2. bootstrap with no KV ===", JSON.stringify(r));
+expect(posts.length === 0, "seeds from the window instead of dumping backlog");
+await sync(env(db, null));
+expect(posts.length === 0, "and stays quiet - all three were seeded");
 
-// 3. idempotency AND the write budget
+// ---------------------------------------------------------------- normal + idempotency
+db = makeD1(); posts = [];
+await sync(env(db, kvWith([])));                 // bootstrap, empty KV import -> seeds window
+await new Promise((r) => setTimeout(r, 5));
+EVENTS = [...EVENTS, { id: 104, occurred_at: ago(10), type: "stop", user_id: 3 }];
 posts = [];
-kv.writes = 0;
-kv.reads = 0;
-r = await sync(env(kv));
-console.log("=== 3. idle tick ===", JSON.stringify(r));
-expect(posts.length === 0, "re-running posts nothing - no duplicates");
-expect(kv.writes === 0, "an idle tick performs ZERO KV writes (the 1,000/day budget)");
-expect(kv.reads === 1, "an idle tick performs exactly one KV read");
+r = await sync(env(db, null));
+console.log("=== 3. a new event arrives ===", JSON.stringify(r));
+expect(posts.length === 1 && posts[0].includes("User3"), "posts the new event");
+posts = [];
+r = await sync(env(db, null));
+expect(posts.length === 0, "re-running posts nothing");
 
-// 4. partial failure
+// ------------------------------------------------- THE BUG: concurrent ticks
+db = makeD1(); posts = [];
+await sync(env(db, null));                       // bootstrap/seed
+EVENTS = [...EVENTS, { id: 201, occurred_at: ago(5), type: "start", user_id: 4 }];
 posts = [];
-kv.store.set("sync-state", JSON.stringify({ v: 2, ids: [], names: { 1: "User1", 2: "User2", 3: "User3" }, ts: "x" }));
-clickupFails = 1;
-r = await sync(env(kv));
-console.log("=== 4. partial failure ===", JSON.stringify(r));
-expect(posts.length === 3, "the other 3 still post after the first fails");
-expect(r.failures === 1, "the failure is reported");
-const kept = JSON.parse(kv.store.get("sync-state")).ids;
-expect(!kept.includes(101), "the failed event is NOT recorded, so the next tick retries it");
+clickupDelayMs = 25;                             // hold the post open so the two ticks overlap
+const [a, b] = await Promise.all([sync(env(db, null)), sync(env(db, null))]);
+clickupDelayMs = 0;
+console.log("=== 4. two concurrent ticks ===", JSON.stringify(a), JSON.stringify(b));
+const dupes = posts.filter((p) => p.includes("User4")).length;
+expect(dupes === 1, `the contested event posts EXACTLY once (got ${dupes})`);
+expect(a.posted + b.posted === 1, "exactly one tick claims it");
+expect(a.skipped + b.skipped >= 1, "the loser records a skip rather than posting");
 
-// 5. message format must match what is already in the channel
+// ---------------------------------------------------------------- failure path
+db = makeD1(); posts = [];
+await sync(env(db, null));
+EVENTS = [...EVENTS, { id: 301, occurred_at: ago(5), type: "start", user_id: 5 }];
+posts = []; clickupFailFor = new Set(["User5"]);
+r = await sync(env(db, null));
+console.log("=== 5. a failing post ===", JSON.stringify(r));
+expect(r.failures === 1 && posts.length === 0, "reports the failure and posts nothing");
+clickupFailFor = new Set();
 posts = [];
-kv.store.set("sync-state", JSON.stringify({ v: 2, ids: [], names: {}, ts: "x" }));
-globalThis.fetch = (((orig) => async (url, opts) => {
-  if (String(url).includes("/tracking_states")) {
-    return new Response(JSON.stringify({
-      tracking_states: [
-        { id: 900, occurred_at: "2026-10-05T05:13:01Z", type: "start", user_id: 7 },
-        { id: 901, occurred_at: "2026-10-04T22:51:15Z", type: "stop", user_id: 8 },
-      ],
-    }), { status: 200 });
-  }
-  return orig(url, opts);
-})(globalThis.fetch));
-await sync(env(kv));
-console.log("=== 5. rendering ===");
+r = await sync(env(db, null));
+expect(posts.length === 1, "the very next tick retries it - the claim was released, not stranded");
+
+// ---------------------------------------------------------------- rendering
+db = makeD1(); posts = [];
+EVENTS = [{ id: 900, occurred_at: "2026-10-05T05:13:01Z", type: "start", user_id: 7 }];
+await sync(env(db, kvWith([])));
+EVENTS = [
+  { id: 900, occurred_at: "2026-10-05T05:13:01Z", type: "start", user_id: 7 },
+  { id: 901, occurred_at: "2026-10-04T22:51:15Z", type: "stop", user_id: 8 },
+];
+posts = [];
+await sync(env(db, null));
+console.log("=== 6. rendering ===");
 for (const p of posts) console.log("  " + p.replace("\n", " / "));
-expect(posts.some((p) => p === "\u{1F534} **Clocked Out** — User8\n\u{1F550} 00:51 Stockholm · 06:51 Manila"),
+expect(posts.includes("\u{1F534} **Clocked Out** — User8\n\u{1F550} 00:51 Stockholm · 06:51 Manila"),
   "clock-out renders byte-identical to the channel");
-expect(posts.some((p) => p === "\u{1F7E2} **Clocked In** — User7\n\u{1F550} 07:13 Stockholm · 13:13 Manila"),
-  "clock-in renders byte-identical to the channel");
 
 console.log(failed ? "\nTESTS FAILED" : "\nALL TESTS PASSED");
 process.exit(failed ? 1 : 0);

@@ -7,8 +7,18 @@ compatibility_date = "2026-10-05"
 [triggers]
 crons = ["* * * * *"]
 
-# Create with:  wrangler kv namespace create SYNC_STATE
-# then paste the printed id below.
+# State lives in D1, not KV. KV has no compare-and-set, so the read -> post -> write
+# it required was a lost update: two concurrent cron invocations both read before
+# either wrote and both posted. D1's PRIMARY KEY makes the claim atomic.
+# Create with:  wrangler d1 create hubstaff-clickup
+[[d1_databases]]
+binding = "DB"
+database_name = "hubstaff-clickup"
+database_id = "PASTE_D1_DATABASE_ID_HERE"
+
+# Kept only so the first run can carry the already-posted ids out of KV and into
+# D1. Safe to delete this binding and the namespace once /health reports
+# "bootstrapped".
 [[kv_namespaces]]
 binding = "SYNC_STATE"
 id = "PASTE_KV_NAMESPACE_ID_HERE"

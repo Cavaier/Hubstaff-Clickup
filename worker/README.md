@@ -14,6 +14,31 @@ What carried over unchanged is the property that matters: **idempotent, not
 incremental**. Every tick re-reads a 6-hour window and skips any event id it has already
 posted. Late arrivals, missed ticks and restarts all heal on the next pass.
 
+## Exactly-once, and why KV could not do it
+
+Cron triggers are at-least-once and nothing serialises them, so two invocations can
+run at the same time. The first version kept state in KV and did
+`read -> post -> write`. That is a lost update: both invocations read before either
+wrote, both saw the event as unposted, and both posted. It produced real duplicates in
+the channel - the same message twice, 28ms to 379ms apart.
+
+KV cannot fix this; it has no compare-and-set. D1 can. The event id is a PRIMARY KEY,
+so `INSERT OR IGNORE` is an atomic claim: exactly one caller gets `changes == 1` and
+posts, every other caller gets `0` and skips.
+
+Claiming before posting introduces the opposite risk - a claim whose post never
+happened would never retry - so a claim is a lease:
+
+| | |
+|---|---|
+| Claim | `INSERT OR IGNORE` with `sent = 0` |
+| Post succeeded | `UPDATE ... SET sent = 1` |
+| Post failed | row deleted, so the next tick retries immediately |
+| Claimer died mid-post | another tick retakes it after `STALE_CLAIM_MS` (120s) |
+
+A test covers this with two `sync()` calls raced against each other, backed by real
+SQLite rather than a mock, asserting the contested event posts exactly once.
+
 ## Free-plan budget
 
 This is shaped around the free limits, not merely fitting inside them:
@@ -21,13 +46,13 @@ This is shaped around the free limits, not merely fitting inside them:
 | | Limit | Used |
 |---|---|---|
 | Requests | 100,000/day | 1,440 (one per minute) |
-| KV reads | 100,000/day | 1,440 (one per tick) |
-| **KV writes** | **1,000/day** | **tens** — only when something changed |
+| D1 rows read | 5,000,000/day | a few per tick |
+| D1 rows written | 100,000/day | tens — only on real events |
 | CPU | 10ms/request | two JSON parses; the fetches are I/O |
 
-KV writes are the binding constraint. A tick that finds nothing new writes **nothing** —
-an unconditional write would be 1,440/day and blow the budget by 40%. There's a test
-asserting an idle tick performs zero writes; keep it.
+An idle tick reads a handful of rows and writes none. D1's limits are far looser than
+KV's old 1,000 writes/day, so the budget is no longer the shaping constraint — but
+there is still no reason to write on a tick that found nothing.
 
 ## Deploy
 
@@ -35,12 +60,16 @@ From this directory:
 
 ```bash
 npx wrangler login
-npx wrangler kv namespace create SYNC_STATE   # paste the printed id into wrangler.toml
+npx wrangler d1 create hubstaff-clickup       # paste the printed id into wrangler.toml
 npx wrangler secret put HUBSTAFF_PERSONAL_ACCESS_TOKEN
 npx wrangler secret put CLICKUP_API_TOKEN
 npx wrangler secret put TRIGGER_TOKEN          # optional, enables POST /run
 npx wrangler deploy
 ```
+
+No schema step: the Worker runs `CREATE TABLE IF NOT EXISTS` itself. No seeding step
+either — the first run imports the ids out of the old KV namespace if one is still
+bound, and otherwise seeds from the current window.
 
 Check it: `curl https://hubstaff-clickup-sync.<your-subdomain>.workers.dev/health`
 

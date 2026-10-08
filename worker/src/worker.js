@@ -1,50 +1,78 @@
 /**
  * Hubstaff clock in/out -> ClickUp chat, as a Cloudflare Worker.
  *
- * A port of scripts/hubstaff_clickup_sync.py, carrying over the property that
- * matters: the job is idempotent, not incremental. Every tick re-reads a wide
- * window and skips any event whose Hubstaff id it has already posted. Late
- * arrivals, missed ticks and restarts all heal on the next pass.
+ * Two properties matter, and they are separate problems:
  *
- * Why this exists at all: the same poll on GitHub Actions cost a full workflow
- * run - queue, runner provisioning, checkout - for a fraction of a second of
- * work. At one dispatch a minute that has no headroom, and when GitHub slowed
- * down the backlog grew without bound. Here a tick is a cron trigger with no
- * provisioning in front of it.
+ * 1. NOTHING IS LOST. Every tick re-reads a wide window and skips events it has
+ *    already posted, so a late arrival, a missed tick or a restart heals on the
+ *    next pass. An incremental high-water mark cannot do this: an event that
+ *    becomes visible after the mark passes its occurred_at is gone for good.
  *
- * Free-plan budget (the limits this is shaped around):
- *   requests  100,000/day   - a 1-minute cron uses 1,440
- *   KV reads  100,000/day   - one per tick, so 1,440
- *   KV writes   1,000/day   - THE binding constraint. A tick only writes when
- *                             something actually changed, so writes track the
- *                             number of clock events (tens), not ticks. Do not
- *                             make this write unconditionally.
- *   CPU           10ms/req  - two JSON parses; the fetches are I/O, not CPU.
+ * 2. NOTHING IS POSTED TWICE. Cron triggers are at-least-once and nothing
+ *    serialises them, so two invocations can run concurrently. The first version
+ *    of this Worker kept state in KV and did read -> post -> write, which is a
+ *    lost update: both invocations read before either wrote, both saw the event
+ *    as unposted, and both posted. Real duplicates followed, milliseconds apart.
  *
- * Bindings: KV namespace SYNC_STATE
+ *    KV cannot fix that - it has no compare-and-set. D1 can: the event id is a
+ *    PRIMARY KEY, so `INSERT OR IGNORE` is an atomic claim. Exactly one caller
+ *    gets changes == 1 and posts; everyone else gets 0 and skips.
+ *
+ * Claiming before posting risks the opposite failure - a claim whose post never
+ * happened would never retry - so a claim is a lease: rows carry sent=0 until the
+ * post succeeds, a failed post releases the row immediately, and a claim left
+ * stranded by a dead invocation is retaken after STALE_CLAIM_MS.
+ *
+ * Bindings: D1 database DB, KV namespace SYNC_STATE (only to migrate off KV once)
  * Secrets:  HUBSTAFF_PERSONAL_ACCESS_TOKEN, CLICKUP_API_TOKEN
- *           TRIGGER_TOKEN (optional, enables POST /run for testing)
+ *           TRIGGER_TOKEN (optional, enables POST /run)
  */
 
 const HUBSTAFF_ORG_ID = 482654;
 const CLICKUP_WORKSPACE_ID = "90161343471";
 const CLICKUP_CHANNEL_ID = "2kz0huzf-2076";
 
-// How far back each tick re-reads. Anything inside this survives an outage;
-// anything older is gone. Cheap: a few events for a handful of members.
 const LOOKBACK_MINUTES = 360;
-const MAX_REMEMBERED_IDS = 1000;
 const PAGE_LIMIT = 100;
-const STATE_KEY = "sync-state";
+
+// How long another invocation's claim is respected before we assume it died
+// mid-post and take the event over. Longer than any plausible ClickUp call.
+const STALE_CLAIM_MS = 120_000;
+
+// Rows older than this are pruned; only ever read back within LOOKBACK_MINUTES.
+const RETAIN_DAYS = 7;
 
 // Hubstaff's API sits behind Cloudflare and blocks requests without a browser-like UA.
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS posted_events (
+     id INTEGER PRIMARY KEY,
+     sent INTEGER NOT NULL DEFAULT 0,
+     claimed_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS member_names (
+     user_id INTEGER PRIMARY KEY,
+     name TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS meta (
+     key TEXT PRIMARY KEY,
+     value TEXT NOT NULL
+   )`,
+];
+
 const isoZ = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
 
 const hhmm = (date, timeZone) =>
   new Intl.DateTimeFormat("en-GB", { timeZone, hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+
+// Run every tick rather than caching per isolate. CREATE TABLE IF NOT EXISTS on an
+// existing table writes nothing, so the cost is a few milliseconds, and caching it
+// would silently skip creation for any isolate that outlived the schema.
+async function ensureSchema(env) {
+  await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
+}
 
 async function hubstaffGet(env, path, params) {
   const url = new URL(`https://api.hubstaff.com/v2${path}`);
@@ -97,9 +125,8 @@ async function fetchEvents(env, startDt, stopDt) {
 
     let nextId = body.pagination && body.pagination.next_page_start_id;
     if (!nextId && batch.length === PAGE_LIMIT) {
-      // No documented cursor but a full page. Re-read the boundary row rather than
-      // stepping past it - whether page_start_id is inclusive is undocumented, and the
-      // id dedupe makes a repeat free whereas a skip is the bug this all exists to stop.
+      // Re-read the boundary row rather than stepping past it: whether page_start_id
+      // is inclusive is undocumented, and a repeat is free where a skip is the bug.
       nextId = Math.max(...batch.map((e) => e.id));
     }
     if (!nextId || cursorsSeen.has(nextId)) break;
@@ -118,59 +145,143 @@ function describe(event, name) {
   );
 }
 
-export async function sync(env) {
-  const state = await env.SYNC_STATE.get(STATE_KEY, "json");
+/** Mark ids as already handled without posting. Used for seeding and KV migration. */
+async function markHandled(env, ids, nowMs) {
+  for (let i = 0; i < ids.length; i += 50) {
+    const chunk = ids.slice(i, i + 50);
+    await env.DB.batch(
+      chunk.map((id) =>
+        env.DB.prepare("INSERT OR IGNORE INTO posted_events (id, sent, claimed_at) VALUES (?, 1, ?)").bind(id, nowMs),
+      ),
+    );
+  }
+}
 
-  // No state means seed, do not post: an empty set plus a 6h lookback would otherwise
-  // dump hours of backlog into the channel in one go.
-  const seeding = !state || !Array.isArray(state.ids);
-  const posted = new Set(seeding ? [] : state.ids);
-  const names = (state && state.names) || {};
+/**
+ * One-time handover. Returns true if this tick should post nothing.
+ *
+ * Carries the ids KV already knew about into D1 so the switch loses nothing. With
+ * no KV state to import it falls back to seeding from the current window, because
+ * an empty table plus a 6h lookback would otherwise dump hours of backlog at once.
+ */
+async function bootstrapIfNeeded(env, windowEvents, nowMs) {
+  const done = await env.DB.prepare("SELECT value FROM meta WHERE key = 'bootstrapped'").first();
+  if (done) return false;
+
+  let imported = 0;
+  if (env.SYNC_STATE) {
+    const state = await env.SYNC_STATE.get("sync-state", "json");
+    if (state && Array.isArray(state.ids) && state.ids.length) {
+      await markHandled(env, state.ids, nowMs);
+      imported = state.ids.length;
+    }
+  }
+  if (!imported) await markHandled(env, windowEvents.map((e) => e.id), nowMs);
+
+  await env.DB.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('bootstrapped', ?)")
+    .bind(new Date(nowMs).toISOString())
+    .run();
+
+  console.log(`bootstrapped: ${imported ? `imported ${imported} ids from KV` : `seeded ${windowEvents.length} from window`}`);
+  return true;
+}
+
+async function nameFor(env, userId, cache) {
+  const key = String(userId);
+  if (cache.has(key)) return cache.get(key);
+
+  const row = await env.DB.prepare("SELECT name FROM member_names WHERE user_id = ?").bind(userId).first();
+  if (row) {
+    cache.set(key, row.name);
+    return row.name;
+  }
+  const name = (await hubstaffGet(env, `/users/${key}`)).user.name;
+  await env.DB.prepare("INSERT OR REPLACE INTO member_names (user_id, name) VALUES (?, ?)").bind(userId, name).run();
+  cache.set(key, name);
+  return name;
+}
+
+export async function sync(env) {
+  await ensureSchema(env);
 
   const now = new Date();
-  const since = new Date(now.getTime() - LOOKBACK_MINUTES * 60_000);
+  const nowMs = now.getTime();
+  const since = new Date(nowMs - LOOKBACK_MINUTES * 60_000);
 
   const events = (await fetchEvents(env, since, now))
     .filter((e) => e.type === "start" || e.type === "stop")
     .sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at) || a.id - b.id);
 
-  if (seeding) {
-    const ids = events.map((e) => e.id).sort((a, b) => b - a).slice(0, MAX_REMEMBERED_IDS);
-    await env.SYNC_STATE.put(STATE_KEY, JSON.stringify({ v: 2, ids, names, ts: isoZ(now) }));
-    return { seeded: ids.length, posted: 0 };
+  if (await bootstrapIfNeeded(env, events, nowMs)) {
+    return { bootstrapped: true, posted: 0 };
   }
+  if (!events.length) return { posted: 0, skipped: 0, failures: 0 };
 
-  let changed = false;
-  let postedCount = 0;
+  const placeholders = events.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT id, sent, claimed_at FROM posted_events WHERE id IN (${placeholders})`,
+  )
+    .bind(...events.map((e) => e.id))
+    .all();
+  const known = new Map((results || []).map((r) => [r.id, r]));
+
+  const names = new Map();
+  let posted = 0;
+  let skipped = 0;
   let failures = 0;
 
   for (const event of events) {
-    if (posted.has(event.id)) continue;
-    const uid = String(event.user_id);
-    try {
-      if (!names[uid]) {
-        names[uid] = (await hubstaffGet(env, `/users/${uid}`)).user.name;
-        changed = true;
-      }
-      await clickupSend(env, describe(event, names[uid]));
-    } catch (err) {
-      // One bad post must not strand the rest. The id stays unrecorded, so the next
-      // tick retries it.
-      failures++;
-      console.log(`post failed for event ${event.id} (user_id=${uid}): ${err && err.message}`);
+    const row = known.get(event.id);
+    if (row && row.sent === 1) continue;
+
+    // Atomically take ownership. Losing here is normal and correct: it means a
+    // concurrent invocation owns this event, and it is the duplicate not happening.
+    let owned = false;
+    if (!row) {
+      const r = await env.DB.prepare(
+        "INSERT OR IGNORE INTO posted_events (id, sent, claimed_at) VALUES (?, 0, ?)",
+      )
+        .bind(event.id, nowMs)
+        .run();
+      owned = r.meta.changes === 1;
+    } else if (nowMs - row.claimed_at > STALE_CLAIM_MS) {
+      // Claimed but never sent, and stale - whoever held it died mid-post.
+      const r = await env.DB.prepare(
+        "UPDATE posted_events SET claimed_at = ? WHERE id = ? AND sent = 0 AND claimed_at = ?",
+      )
+        .bind(nowMs, event.id, row.claimed_at)
+        .run();
+      owned = r.meta.changes === 1;
+    }
+
+    if (!owned) {
+      skipped++;
       continue;
     }
-    posted.add(event.id);
-    changed = true;
-    postedCount++;
+
+    try {
+      await clickupSend(env, describe(event, await nameFor(env, event.user_id, names)));
+    } catch (err) {
+      // Release the claim so the next tick retries at once instead of waiting out
+      // STALE_CLAIM_MS. One bad post must not strand the rest of the batch.
+      failures++;
+      await env.DB.prepare("DELETE FROM posted_events WHERE id = ? AND sent = 0").bind(event.id).run();
+      console.log(`post failed for event ${event.id} (user_id=${event.user_id}): ${err && err.message}`);
+      continue;
+    }
+
+    await env.DB.prepare("UPDATE posted_events SET sent = 1 WHERE id = ?").bind(event.id).run();
+    posted++;
+    // Deliberately not logging names or message bodies.
+    console.log(`posted ${event.type} event ${event.id} (user_id=${event.user_id})`);
   }
 
-  // Only write when something changed - see the KV write budget at the top.
-  if (changed) {
-    const ids = [...posted].sort((a, b) => b - a).slice(0, MAX_REMEMBERED_IDS);
-    await env.SYNC_STATE.put(STATE_KEY, JSON.stringify({ v: 2, ids, names, ts: isoZ(now) }));
+  if (posted) {
+    await env.DB.prepare("DELETE FROM posted_events WHERE claimed_at < ?")
+      .bind(nowMs - RETAIN_DAYS * 86_400_000)
+      .run();
   }
-  return { posted: postedCount, failures, remembered: posted.size };
+  return { posted, skipped, failures };
 }
 
 export default {
@@ -187,31 +298,31 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
-      // Report a misconfiguration as readable JSON. Reaching into a missing binding or
-      // secret otherwise throws, and the Worker surfaces that as a bare "Error 1101"
-      // with nothing to act on.
-      const missing = ["SYNC_STATE", "HUBSTAFF_PERSONAL_ACCESS_TOKEN", "CLICKUP_API_TOKEN"]
-        .filter((k) => !env[k]);
+      const missing = ["DB", "HUBSTAFF_PERSONAL_ACCESS_TOKEN", "CLICKUP_API_TOKEN"].filter((k) => !env[k]);
       if (missing.length) {
         return Response.json(
-          { ok: false, missing, hint: "Worker -> Settings: SYNC_STATE is a KV namespace binding; the other two are Secrets." },
+          { ok: false, missing, hint: "Worker -> Settings: DB is a D1 binding; the other two are Secrets." },
           { status: 500 },
         );
       }
       try {
-        const state = await env.SYNC_STATE.get(STATE_KEY, "json");
+        await ensureSchema(env);
+        const boot = await env.DB.prepare("SELECT value FROM meta WHERE key = 'bootstrapped'").first();
+        const counts = await env.DB.prepare(
+          "SELECT COUNT(*) AS total, SUM(sent) AS sent FROM posted_events",
+        ).first();
         return Response.json({
           ok: true,
-          seeded: Boolean(state && Array.isArray(state.ids)),
-          last_state_write: (state && state.ts) || null,
-          remembered_ids: (state && state.ids && state.ids.length) || 0,
+          store: "d1",
+          bootstrapped: boot ? boot.value : null,
+          tracked_events: (counts && counts.total) || 0,
+          sent_events: (counts && counts.sent) || 0,
         });
       } catch (e) {
         return Response.json({ ok: false, error: e && e.message }, { status: 500 });
       }
     }
 
-    // Manual tick, for verifying a deploy without waiting for the cron.
     if (url.pathname === "/run" && request.method === "POST") {
       if (!env.TRIGGER_TOKEN || url.searchParams.get("token") !== env.TRIGGER_TOKEN) {
         return new Response("Forbidden", { status: 403 });
